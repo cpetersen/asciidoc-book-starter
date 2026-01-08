@@ -97,6 +97,18 @@ Static assets for the book are stored in the `book` directory, and include the f
 - The `images` directory is where you can store images that are used in the book. Inside this directory is a `cover.jpeg` image used for the book's cover, and a `space.jpeg` used as an example for an image in the book.
 - The `fonts` directory is where you can store fonts that are used in the book. It currently houses the [Open Sans](https://fonts.google.com/specimen/Open+Sans) and [Source Code Pro](https://fonts.google.com/specimen/Source+Code+Pro?query=source+code+pro) fonts, both with their original `.zip` file archived as downloaded from the Google Fonts website as well as extracted each to its own directory.
 
+### Icons
+
+The `book/images/icons` directory contains SVG icons used for inline icons (`icon:name[]`) and admonition blocks (`[TIP]`, `[WARNING]`, etc.) when exporting to Word (DOCX) format.
+
+**Attribution:** Icons are from [Font Awesome Free](https://fontawesome.com) and are licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+**Adding new icons:** If you need additional icons, download them from the [Font Awesome GitHub repository](https://github.com/FortAwesome/Font-Awesome/tree/6.x/svgs):
+- Solid icons: `svgs/solid/`
+- Brand icons: `svgs/brands/`
+
+Save the SVG with the same name you use in your AsciiDoc (e.g., `icon:rocket[]` needs `rocket.svg`).
+
 ## Author
 
 Liran Tal <liran@lirantal.com>

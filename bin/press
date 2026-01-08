@@ -134,10 +134,14 @@ class PressCLI < Thor
       say "  #{sect[:name]}..."
 
       # Step 1: AsciiDoc → DocBook
+      # Set icontype=svg and iconsdir to use SVG icons from book/images/icons
       system(
         'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
         'asciidoctor/docker-asciidoctor', 'asciidoctor',
         '-b', 'docbook',
+        '-a', 'icons=image',
+        '-a', 'icontype=svg',
+        '-a', 'iconsdir=/documents/book/images/icons',
         '-o', "/documents/#{options[:output_dir]}/#{sect[:name]}.xml",
         "/documents/#{sect[:relative_path]}"
       )
@@ -148,10 +152,15 @@ class PressCLI < Thor
       end
 
       # Step 2: DocBook → Word
+      # Mount entire project and set working directory to section's base dir for image resolution
       system(
-        'docker', 'run', '--rm', '-v', "#{output_dir}:/data",
+        'docker', 'run', '--rm',
+        '-v', "#{ROOT_DIR}:/documents",
+        '-w', "/documents/#{sect[:base_dir]}",
         'pandoc/core',
-        "#{sect[:name]}.xml", '-f', 'docbook', '-t', 'docx', '-o', "#{sect[:name]}.docx"
+        "/documents/#{options[:output_dir]}/#{sect[:name]}.xml",
+        '-f', 'docbook', '-t', 'docx',
+        '-o', "/documents/#{options[:output_dir]}/#{sect[:name]}.docx"
       )
 
       if $?.success?
@@ -181,16 +190,18 @@ class PressCLI < Thor
         # Chapter directory: chapter-01-name/content.adoc
         name = include_path.split('/').first
         relative_path = "book/#{include_path}"
+        base_dir = "book/#{name}"
       else
         # Standalone file: introduction.adoc
         name = File.basename(include_path, '.adoc')
         relative_path = "book/#{include_path}"
+        base_dir = 'book'
       end
 
       full_path = File.join(BOOK_DIR, include_path)
       next unless File.exist?(full_path)
 
-      sections << { name: name, relative_path: relative_path, full_path: full_path }
+      sections << { name: name, relative_path: relative_path, full_path: full_path, base_dir: base_dir }
     end
 
     sections
