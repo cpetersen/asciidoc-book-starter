@@ -48,12 +48,12 @@ BOOK_GENRE = BOOK_CONFIG.dig('audiobook', 'genre') || 'Audiobook'
 # Derive filename from config or book title (lowercase, hyphens for spaces, alphanumeric only)
 BOOK_FILENAME = (BOOK_CONFIG['filename'] || BOOK_TITLE).downcase.gsub(/[^a-z0-9\s-]/, '').gsub(/\s+/, '-')
 
-# Helper methods for formatted metadata
-def self.book_full_title
+# Helper methods for formatted metadata (defined as regular methods so they're available everywhere)
+def book_full_title
   BOOK_SUBTITLE.to_s.empty? ? BOOK_TITLE : "#{BOOK_TITLE}: #{BOOK_SUBTITLE}"
 end
 
-def self.book_authors_string
+def book_authors_string
   BOOK_AUTHORS.join(' and ')
 end
 
@@ -783,9 +783,9 @@ class AudiobookBuilder
     end
 
     cmd = ['ffmpeg', '-y', '-i', concat_path, '-i', chapters_path]
-    cover_path = File.join(BOOK_DIR, 'images/cover-square.png')
+    cover_path = find_audiobook_cover
 
-    if File.exist?(cover_path)
+    if cover_path
       cmd += ['-i', cover_path, '-map', '0:a', '-map', '2:v']
       cmd += ['-disposition:v', 'attached_pic']
     else
@@ -799,7 +799,7 @@ class AudiobookBuilder
     cmd += ['-metadata', "genre=#{BOOK_GENRE}"]
     cmd += ['-metadata', "date=#{Time.now.year}"]
     cmd += ['-c:a', 'copy']
-    cmd += ['-c:v', 'copy'] if File.exist?(cover_path)
+    cmd += ['-c:v', 'copy'] if cover_path
     cmd << output_path
 
     puts "Executing: #{cmd.join(' ')}"
@@ -854,6 +854,41 @@ class AudiobookBuilder
 
   def number_with_commas(number)
     number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  def find_audiobook_cover
+    # Check config first
+    config_cover = BOOK_CONFIG.dig('audiobook', 'cover')
+    if config_cover
+      path = File.join(BOOK_DIR, config_cover)
+      if File.exist?(path)
+        puts "Using cover from config: #{path}"
+        return path
+      else
+        puts "Warning: Configured cover not found: #{path}"
+      end
+    end
+
+    # Fall back to common cover filenames
+    fallbacks = %w[
+      images/cover-square.png
+      images/cover-square.jpg
+      images/cover-square.jpeg
+      images/cover.png
+      images/cover.jpg
+      images/cover.jpeg
+    ]
+
+    fallbacks.each do |filename|
+      path = File.join(BOOK_DIR, filename)
+      if File.exist?(path)
+        puts "Using cover: #{path}"
+        return path
+      end
+    end
+
+    puts 'Warning: No cover image found for audiobook'
+    nil
   end
 end
 

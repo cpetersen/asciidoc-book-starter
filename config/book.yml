@@ -12,3 +12,5 @@ authors:
 # Audiobook-specific settings
 audiobook:
   genre: "Audiobook"
+  # cover: "images/cover-square.png"  # Optional: path relative to book/ directory
+                                      # Falls back to cover-square.png, cover.png, cover.jpeg
