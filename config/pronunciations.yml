@@ -1,0 +1,29 @@
+# Pronunciation mappings for TTS
+# Format: "original phrase" => "phonetic replacement"
+#
+# Add new pronunciations as needed. The replacements are applied
+# in order, so put longer phrases before shorter ones if they overlap.
+#
+# Examples:
+#   "CRISPR" => "crisper"
+#   "mRNA" => "messenger RNA"
+
+pronunciations:
+  # Lead (as in lead compound) vs Lead (as in lead pipe)
+  "lead optimization": "leed optimization"
+  "lead optimized": "leed optimized"
+  "lead compound": "leed compound"
+  "lead series": "leed series"
+  "CD4+": "CD4-positive"
+  "HER2+": "her-two-positive"
+
+  # Acronyms that should be pronounced as words
+  "ADME": "add-me"
+  "IACUC": "eye-uh-cuck"
+
+  # This is a weird one where we show the abbreviation in the text and explain the pronunciation, but use the pronunciation in audio and explain the abbreviation
+  "eye-uh-cuck (pronounced \"eye-uh-cuck\")": "eye-uh-cuck (abbreviated I-A-C-U-C)"
+
+  # Acronyms/initialisms that need specific pronunciation
+  "ACT UP": "act-up"
+  "U=U": "you equals you"
