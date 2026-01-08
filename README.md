@@ -109,6 +109,16 @@ The `book/images/icons` directory contains SVG icons used for inline icons (`ico
 
 Save the SVG with the same name you use in your AsciiDoc (e.g., `icon:rocket[]` needs `rocket.svg`).
 
+**Important:** After downloading, add `width="16" height="16"` to the `<svg>` tag. Font Awesome SVGs don't include dimensions by default, which causes them to render very large in Word documents. For example:
+
+```xml
+<!-- Before -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">...</svg>
+
+<!-- After -->
+<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">...</svg>
+```
+
 ## Author
 
 Liran Tal <liran@lirantal.com>
