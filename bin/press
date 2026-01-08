@@ -1,0 +1,1581 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'bundler/setup'
+require 'thor'
+require 'csv'
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'openssl'
+require 'time'
+require 'uri'
+require 'yaml'
+
+# Root directory of the project
+ROOT_DIR = File.expand_path('..', __dir__)
+BOOK_DIR = File.join(ROOT_DIR, 'book')
+BUILD_DIR = File.join(ROOT_DIR, 'build')
+AUDIO_DIR = File.join(BUILD_DIR, 'audio')
+DOCX_DIR = File.join(BUILD_DIR, 'docx')
+NOTES_DIR = File.join(ROOT_DIR, 'notes')
+CONFIG_DIR = File.join(ROOT_DIR, 'config')
+PRONUNCIATIONS_FILE = File.join(CONFIG_DIR, 'pronunciations.yml')
+
+# Book metadata - loaded from config/book.yml
+BOOK_CONFIG_FILE = File.join(CONFIG_DIR, 'book.yml')
+
+def self.load_book_config
+  unless File.exist?(BOOK_CONFIG_FILE)
+    warn "Warning: #{BOOK_CONFIG_FILE} not found. Using defaults."
+    return {
+      'title' => 'Untitled Book',
+      'subtitle' => '',
+      'authors' => ['Unknown Author'],
+      'audiobook' => { 'genre' => 'Audiobook' }
+    }
+  end
+  YAML.load_file(BOOK_CONFIG_FILE)
+end
+
+BOOK_CONFIG = load_book_config
+BOOK_TITLE = BOOK_CONFIG['title']
+BOOK_SUBTITLE = BOOK_CONFIG['subtitle'] || ''
+BOOK_AUTHORS = BOOK_CONFIG['authors'] || []
+BOOK_GENRE = BOOK_CONFIG.dig('audiobook', 'genre') || 'Audiobook'
+
+# Derive filename from config or book title (lowercase, hyphens for spaces, alphanumeric only)
+BOOK_FILENAME = (BOOK_CONFIG['filename'] || BOOK_TITLE).downcase.gsub(/[^a-z0-9\s-]/, '').gsub(/\s+/, '-')
+
+# Helper methods for formatted metadata
+def self.book_full_title
+  BOOK_SUBTITLE.to_s.empty? ? BOOK_TITLE : "#{BOOK_TITLE}: #{BOOK_SUBTITLE}"
+end
+
+def self.book_authors_string
+  BOOK_AUTHORS.join(' and ')
+end
+
+class PressCLI < Thor
+  def self.exit_on_failure?
+    true
+  end
+
+  # ==========================================================================
+  # BUILD COMMANDS
+  # ==========================================================================
+
+  desc 'pdf', 'Build the book as PDF (requires Docker)'
+  def pdf
+    say 'Building PDF...', :green
+    Dir.chdir(ROOT_DIR) do
+      system(
+        'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
+        'asciidoctor/docker-asciidoctor', 'asciidoctor-pdf',
+        '-D', 'build',
+        '-o', "#{BOOK_FILENAME}.pdf",
+        'book/index.adoc'
+      )
+    end
+    if $?.success?
+      say "Created: #{File.join(BUILD_DIR, "#{BOOK_FILENAME}.pdf")}", :green
+    else
+      say 'PDF build failed', :red
+      exit 1
+    end
+  end
+
+  desc 'epub', 'Build the book as ePub (requires Docker)'
+  def epub
+    say 'Building ePub...', :green
+    Dir.chdir(ROOT_DIR) do
+      system(
+        'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
+        'asciidoctor/docker-asciidoctor:1.63', 'asciidoctor-epub3',
+        '-D', 'build',
+        '-o', "#{BOOK_FILENAME}.epub",
+        'book/index.adoc'
+      )
+    end
+    if $?.success?
+      say "Created: #{File.join(BUILD_DIR, "#{BOOK_FILENAME}.epub")}", :green
+    else
+      say 'ePub build failed', :red
+      exit 1
+    end
+  end
+
+  desc 'docx [SECTION]', 'Export section(s) to Word format (requires Docker)'
+  method_option :output_dir, type: :string, default: 'build/docx', desc: 'Output directory'
+  def docx(section = nil)
+    say 'Exporting to Word...', :green
+
+    # Parse index.adoc to get sections in order
+    sections = discover_sections_from_index
+
+    if section
+      # Filter to matching section
+      sections = sections.select { |s| s[:name].downcase.include?(section.downcase) }
+    end
+
+    if sections.empty?
+      say "No sections found#{section ? " matching '#{section}'" : ''}", :red
+      exit 1
+    end
+
+    output_dir = File.join(ROOT_DIR, options[:output_dir])
+    FileUtils.mkdir_p(output_dir)
+
+    sections.each do |sect|
+      docbook_path = File.join(output_dir, "#{sect[:name]}.xml")
+      docx_path = File.join(output_dir, "#{sect[:name]}.docx")
+
+      say "  #{sect[:name]}..."
+
+      # Step 1: AsciiDoc → DocBook
+      # Set icontype=svg and iconsdir to use SVG icons from book/images/icons
+      system(
+        'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
+        'asciidoctor/docker-asciidoctor', 'asciidoctor',
+        '-b', 'docbook',
+        '-a', 'icons=image',
+        '-a', 'icontype=svg',
+        '-a', 'iconsdir=/documents/book/images/icons',
+        '-o', "/documents/#{options[:output_dir]}/#{sect[:name]}.xml",
+        "/documents/#{sect[:relative_path]}"
+      )
+
+      unless $?.success?
+        say "    Failed to convert to DocBook", :red
+        next
+      end
+
+      # Step 2: DocBook → Word
+      # Mount entire project and set working directory to section's base dir for image resolution
+      system(
+        'docker', 'run', '--rm',
+        '-v', "#{ROOT_DIR}:/documents",
+        '-w', "/documents/#{sect[:base_dir]}",
+        'pandoc/core',
+        "/documents/#{options[:output_dir]}/#{sect[:name]}.xml",
+        '-f', 'docbook', '-t', 'docx',
+        '-o', "/documents/#{options[:output_dir]}/#{sect[:name]}.docx"
+      )
+
+      if $?.success?
+        FileUtils.rm_f(docbook_path) # Clean up intermediate file
+        say "    Created: #{docx_path}", :green
+      else
+        say "    Failed to convert to Word", :red
+      end
+    end
+
+    say 'Done!', :green
+  end
+
+  private
+
+  def discover_sections_from_index
+    index_path = File.join(BOOK_DIR, 'index.adoc')
+    return [] unless File.exist?(index_path)
+
+    sections = []
+    File.read(index_path).each_line do |line|
+      next unless line =~ /^include::(.+)\[\]$/
+
+      include_path = $1
+
+      if include_path.include?('/')
+        # Chapter directory: chapter-01-name/content.adoc
+        name = include_path.split('/').first
+        relative_path = "book/#{include_path}"
+        base_dir = "book/#{name}"
+      else
+        # Standalone file: introduction.adoc
+        name = File.basename(include_path, '.adoc')
+        relative_path = "book/#{include_path}"
+        base_dir = 'book'
+      end
+
+      full_path = File.join(BOOK_DIR, include_path)
+      next unless File.exist?(full_path)
+
+      sections << { name: name, relative_path: relative_path, full_path: full_path, base_dir: base_dir }
+    end
+
+    sections
+  end
+
+  public
+
+  desc 'import_docx FILE', 'Import Word file with track changes visible'
+  method_option :output, type: :string, aliases: '-o', desc: 'Output file path'
+  method_option :format, type: :string, default: 'asciidoc', desc: 'Output format (asciidoc, markdown)'
+  method_option :track_changes, type: :string, default: 'all', desc: 'Track changes mode (all, accept, reject)'
+  def import_docx(file)
+    unless File.exist?(file)
+      say "File not found: #{file}", :red
+      exit 1
+    end
+
+    output_file = options[:output] || file.sub(/\.docx$/, "-changes.#{options[:format] == 'markdown' ? 'md' : 'adoc'}")
+    format = options[:format] == 'markdown' ? 'markdown' : 'asciidoc'
+
+    say "Importing #{file} with track-changes=#{options[:track_changes]}...", :green
+
+    file_dir = File.dirname(File.expand_path(file))
+    file_name = File.basename(file)
+    output_name = File.basename(output_file)
+
+    system(
+      'docker', 'run', '--rm', '-v', "#{file_dir}:/data",
+      'pandoc/core',
+      file_name,
+      "--track-changes=#{options[:track_changes]}",
+      '-t', format,
+      '-o', output_name
+    )
+
+    if $?.success?
+      # Move output to correct location if different from file_dir
+      if File.dirname(File.expand_path(output_file)) != file_dir
+        FileUtils.mv(File.join(file_dir, output_name), output_file)
+      end
+      say "Created: #{output_file}", :green
+      say '', :green
+      say 'Track changes markup:', :yellow
+      say '  [text]{.insertion author="Name" date="..."}  = Added text', :yellow
+      say '  [text]{.deletion author="Name" date="..."}   = Deleted text', :yellow
+      say '  [text]{.comment-start}...[]{.comment-end}    = Comments', :yellow
+    else
+      say 'Import failed', :red
+      exit 1
+    end
+  end
+
+  desc 'covers', 'Convert SVG covers to PNG'
+  method_option :width, type: :numeric, default: 1600, desc: 'Output width in pixels'
+  def covers
+    images_dir = File.join(BOOK_DIR, 'images')
+    svg_files = Dir.glob(File.join(images_dir, 'cover*.svg'))
+
+    if svg_files.empty?
+      say 'No SVG cover files found in book/images/', :yellow
+      return
+    end
+
+    converter = find_svg_converter
+    unless converter
+      say 'No SVG converter found. Install one of:', :red
+      say '  brew install librsvg    # for rsvg-convert', :red
+      say '  brew install imagemagick  # for convert', :red
+      exit 1
+    end
+
+    say "Using #{converter} to convert SVG covers...", :green
+
+    svg_files.each do |svg_path|
+      png_path = svg_path.sub(/\.svg$/, '.png')
+      say "  #{File.basename(svg_path)} -> #{File.basename(png_path)}"
+
+      success = case converter
+                when :rsvg
+                  system('rsvg-convert', '-w', options[:width].to_s, svg_path, '-o', png_path)
+                when :magick
+                  system('magick', '-background', 'none', '-density', '300',
+                         svg_path, '-resize', "#{options[:width]}x", png_path)
+                when :convert
+                  system('convert', '-background', 'none', '-density', '300',
+                         svg_path, '-resize', "#{options[:width]}x", png_path)
+                end
+
+      unless success
+        say "    Failed to convert #{File.basename(svg_path)}", :red
+      end
+    end
+
+    say 'Done!', :green
+  end
+
+  private
+
+  def find_svg_converter
+    return :rsvg if system('which rsvg-convert > /dev/null 2>&1')
+    return :magick if system('which magick > /dev/null 2>&1')
+    return :convert if system('which convert > /dev/null 2>&1')
+    nil
+  end
+
+  public
+
+  # ==========================================================================
+  # AUDIOBOOK COMMANDS
+  # ==========================================================================
+
+  desc 'audiobook', 'Build audiobook using OpenAI TTS'
+  method_option :chapter, type: :string, desc: 'Build only the specified chapter'
+  method_option :dry_run, type: :boolean, default: false, desc: 'Show what would be built'
+  method_option :force, type: :boolean, default: false, desc: 'Rebuild all chapters'
+  method_option :voice, type: :string, default: 'shimmer',
+                        desc: 'Voice to use (alloy, echo, fable, nova, onyx, shimmer)'
+  def audiobook
+    AudiobookBuilder.new(options.to_h.transform_keys(&:to_sym)).run
+  end
+
+  # ==========================================================================
+  # STATS COMMANDS
+  # ==========================================================================
+
+  desc 'stats', 'Generate book statistics'
+  method_option :by_chapter, type: :boolean, default: false, desc: 'Show breakdown by chapter'
+  method_option :json, type: :boolean, default: false, desc: 'Output as JSON'
+  def stats
+    BookStats.new(options.to_h.transform_keys(&:to_sym)).run
+  end
+
+  # ==========================================================================
+  # EXPORT COMMANDS
+  # ==========================================================================
+
+  desc 'export FORMAT', 'Export book to different formats (txt, markdown)'
+  method_option :output, type: :string, aliases: '-o', desc: 'Output file path'
+  def export(format)
+    format_sym = format.to_sym
+    format_sym = :markdown if format_sym == :md
+
+    unless %i[txt markdown].include?(format_sym)
+      say "Unknown format: #{format}. Use 'txt' or 'markdown'", :red
+      exit 1
+    end
+
+    BookExporter.new(format: format_sym, output: options[:output]).run
+  end
+
+  # ==========================================================================
+  # TRANSCRIPTION COMMANDS
+  # ==========================================================================
+
+  desc 'transcribe', 'Transcribe voice notes from notes/audio using OpenAI Whisper'
+  method_option :dry_run, type: :boolean, default: false, desc: 'Show what would be transcribed'
+  def transcribe
+    NoteTranscriber.new(options.to_h.transform_keys(&:to_sym)).run
+  end
+end
+
+# ============================================================================
+# AUDIOBOOK BUILDER
+# ============================================================================
+
+class AudiobookBuilder
+  MANIFEST_PATH = File.join(AUDIO_DIR, 'manifest.json')
+  OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech'
+  OPENAI_TTS_MODEL = 'tts-1-hd'
+  AVAILABLE_VOICES = %w[alloy echo fable nova onyx shimmer].freeze
+  COST_PER_MILLION_CHARS = 30.0
+
+  def initialize(options = {})
+    @voice = options[:voice] || 'shimmer'
+    @dry_run = options[:dry_run] || false
+    @force = options[:force] || false
+    @single_chapter = options[:chapter]
+    @manifest = load_manifest
+
+    unless AVAILABLE_VOICES.include?(@voice)
+      puts "Error: Invalid voice '#{@voice}'. Available: #{AVAILABLE_VOICES.join(', ')}"
+      exit 1
+    end
+  end
+
+  def run
+    ensure_directories
+    chapters = discover_chapters
+
+    if @single_chapter
+      chapters = chapters.select { |c| c[:id].include?(@single_chapter) }
+      if chapters.empty?
+        puts "No chapter found matching '#{@single_chapter}'"
+        exit 1
+      end
+    end
+
+    if @dry_run
+      show_dry_run(chapters)
+      return
+    end
+
+    validate_api_key!
+
+    chapters_to_build = @force ? chapters : chapters_needing_rebuild(chapters)
+
+    if chapters_to_build.empty?
+      puts 'All chapters up to date.'
+    else
+      puts "Building #{chapters_to_build.length} chapter(s)..."
+      chapters_to_build.each { |chapter| build_chapter(chapter) }
+    end
+
+    assemble_audiobook(chapters) unless @single_chapter
+
+    save_manifest
+    puts 'Done!'
+  end
+
+  private
+
+  def ensure_directories
+    FileUtils.mkdir_p(AUDIO_DIR)
+    FileUtils.mkdir_p(BUILD_DIR)
+  end
+
+  def discover_chapters
+    index_path = File.join(BOOK_DIR, 'index.adoc')
+    return [] unless File.exist?(index_path)
+
+    index_content = File.read(index_path)
+    chapters = []
+    current_part = nil
+    seen_parts = {}
+    sequence = 0
+
+    index_content.each_line do |line|
+      # Match part declarations like "= Part I: The Machinery"
+      if line =~ /^= (Part [IVX]+): (.+)$/
+        current_part = { number: $1, title: $2.strip }
+      # Match include directives
+      elsif line =~ /^include::(.+)\[\]$/
+        include_path = $1
+
+        # Resolve the full path
+        if include_path.include?('/')
+          # Directory-based include like "chapter-01-the-lock-and-the-key/content.adoc"
+          full_path = File.join(BOOK_DIR, include_path)
+        else
+          # Standalone file like "foreword.adoc"
+          full_path = File.join(BOOK_DIR, include_path)
+        end
+
+        next unless File.exist?(full_path)
+
+        content = File.read(full_path)
+        raw_title = extract_title(content)
+
+        # Determine chapter info based on path
+        if include_path =~ /chapter-(\d+)-([^\/]+)/
+          chapter_num = $1
+          chapter_slug = $2
+          title = "#{chapter_num.to_i}: #{raw_title || chapter_slug.tr('-', ' ').capitalize}"
+          id = "#{chapter_num}-#{chapter_slug}"
+          audio_filename = "#{chapter_num}-#{chapter_slug}.mp3"
+
+          # Check if this chapter starts a new part
+          part_info = current_part
+          is_first_in_part = false
+          if part_info && !seen_parts[part_info[:number]]
+            is_first_in_part = true
+            seen_parts[part_info[:number]] = true
+          end
+
+          plain_text = asciidoc_to_plain_text(content, chapter_num.to_i, part_info, is_first_in_part)
+        else
+          # Front/back matter like foreword.adoc, introduction.adoc, acknowledgements.adoc
+          slug = File.basename(include_path, '.adoc')
+          num = format('%02d', sequence)
+          sequence += 1
+          title = raw_title || slug.capitalize
+          id = "#{num}-#{slug}"
+          audio_filename = "#{num}-#{slug}.mp3"
+          part_info = nil
+
+          plain_text = asciidoc_to_plain_text(content, nil)
+        end
+
+        # Skip very short content (likely placeholders)
+        next if plain_text.strip.empty? || plain_text.length < 100
+
+        text_hash = Digest::SHA256.hexdigest(plain_text)
+
+        chapters << {
+          id: id,
+          num: include_path =~ /chapter-(\d+)/ ? $1 : format('%02d', chapters.length),
+          slug: include_path =~ /chapter-\d+-([^\/]+)/ ? $1 : File.basename(include_path, '.adoc'),
+          title: title,
+          part: part_info,
+          source_path: full_path,
+          audio_path: File.join(AUDIO_DIR, audio_filename),
+          plain_text: plain_text,
+          text_hash: text_hash,
+          char_count: plain_text.length
+        }
+      end
+    end
+
+    chapters
+  end
+
+  def extract_title(content)
+    match = content.match(/^= (.+)$/)
+    match ? match[1].strip : nil
+  end
+
+  def asciidoc_to_plain_text(content, chapter_num = nil, part_info = nil, is_first_in_part = false)
+    text = content.dup
+
+    # Build the opening announcement
+    if chapter_num
+      if is_first_in_part && part_info
+        # Announce the part, then the chapter
+        text.gsub!(/^= (.+)$/, "...\n\n#{part_info[:number]}.\n\n#{part_info[:title]}...\n\nChapter #{chapter_num}.\n\n\\1...")
+      else
+        text.gsub!(/^= (.+)$/, "...\n\nChapter #{chapter_num}.\n\n\\1...")
+      end
+    else
+      text.gsub!(/^= (.+)$/, "...\n\n\\1...")
+    end
+
+    text.gsub!(/^=+ (.+)$/, ".\n\n\\1.\n\n")
+    text.gsub!(/^\[NOTE\]\n====\n.*?\n====$/m, '')
+    text.gsub!(/^\[TIP\]\n====\n.*?\n====$/m, '')
+    text.gsub!(/^\[WARNING\]\n====\n.*?\n====$/m, '')
+    text.gsub!(/^\[IMPORTANT\]\n====\n.*?\n====$/m, '')
+    text.gsub!(/^\[\.lead\]\n/, '')
+    text.gsub!(/^'''$/, '')
+    text.gsub!(/^\[\.text-center\]\n/, '')
+    text.gsub!(/\*\*(.+?)\*\*/, '\1')
+    text.gsub!(/\*(.+?)\*/, '\1')
+    text.gsub!(/__(.+?)__/, '\1')
+    text.gsub!(/_(.+?)_/, '\1')
+    text.gsub!(/`(.+?)`/, '\1')
+    text.gsub!(/\+\+\+(.+?)\+\+\+/, '\1')
+    text.gsub!(/link:.+?\[(.+?)\]/, '\1')
+    text.gsub!(/https?:\/\/\S+\[(.+?)\]/, '\1')
+    text.gsub!(/https?:\/\/\S+/, '')
+    text.gsub!(/image:.+?\[.*?\]/, '')
+    text.gsub!(/^----+$/, '')
+    text.gsub!(/^====+$/, '')
+    text.gsub!(/^\.\.\.\.+$/, '')
+    text.gsub!(/^:.+?:.*$/, '')
+    text.gsub!(/^include::.+$/, '')
+    text.gsub!(/^\* $/, '')
+    text.gsub!(/^\* /, '')
+    text.gsub!(/^\*\* /, '')
+    text.gsub!(/Lorem ipsum.*?\.\.\./, '')
+    text.gsub!(/\n{3,}/, "\n\n")
+
+    # Apply pronunciation fixes for TTS
+    text = apply_pronunciations(text)
+
+    text.strip
+  end
+
+  def load_pronunciations
+    return {} unless File.exist?(PRONUNCIATIONS_FILE)
+
+    config = YAML.load_file(PRONUNCIATIONS_FILE)
+    config['pronunciations'] || {}
+  rescue => e
+    puts "Warning: Could not load pronunciations file: #{e.message}"
+    {}
+  end
+
+  def apply_pronunciations(text)
+    pronunciations = load_pronunciations
+    return text if pronunciations.empty?
+
+    pronunciations.each do |original, replacement|
+      # Case-insensitive replacement while preserving surrounding text
+      text = text.gsub(/#{Regexp.escape(original)}/i, replacement)
+    end
+
+    text
+  end
+
+  def chapters_needing_rebuild(chapters)
+    chapters.select do |chapter|
+      stored = @manifest['chapters']&.find { |c| c['id'] == chapter[:id] }
+      if stored.nil?
+        true
+      elsif stored['text_hash'] != chapter[:text_hash]
+        true
+      elsif stored['voice'] != @voice
+        true
+      elsif !File.exist?(chapter[:audio_path])
+        true
+      else
+        false
+      end
+    end
+  end
+
+  def show_dry_run(chapters)
+    chapters_to_build = @force ? chapters : chapters_needing_rebuild(chapters)
+
+    puts '=' * 60
+    puts 'DRY RUN - No API calls will be made'
+    puts '=' * 60
+    puts
+
+    total_chars = 0
+    chapters.each do |chapter|
+      needs_rebuild = chapters_to_build.include?(chapter)
+      status = needs_rebuild ? '[REBUILD]' : '[OK]'
+      puts "#{status} #{chapter[:id]}"
+      puts "         Title: #{chapter[:title]}"
+      puts "         Characters: #{number_with_commas(chapter[:char_count])}"
+      puts
+      total_chars += chapter[:char_count] if needs_rebuild
+    end
+
+    puts '-' * 60
+    puts "Chapters to build: #{chapters_to_build.length} of #{chapters.length}"
+    puts "Total characters to process: #{number_with_commas(total_chars)}"
+    puts
+    puts "Estimated cost: $#{'%.2f' % (total_chars / 1_000_000.0 * COST_PER_MILLION_CHARS)}"
+    puts "(Based on #{OPENAI_TTS_MODEL} at $#{COST_PER_MILLION_CHARS}/1M characters)"
+    puts
+    puts "Voice: #{@voice}"
+    puts '=' * 60
+  end
+
+  def validate_api_key!
+    return if ENV['OPENAI_API_KEY']
+
+    puts "Error: OPENAI_API_KEY environment variable is not set."
+    puts "Please set it with: export OPENAI_API_KEY='your-key-here'"
+    exit 1
+  end
+
+  def build_chapter(chapter)
+    puts "Building: #{chapter[:id]} (#{chapter[:title]})"
+    puts "  Characters: #{chapter[:char_count]}"
+
+    audio_data = call_openai_tts(chapter[:plain_text])
+    File.binwrite(chapter[:audio_path], audio_data)
+    puts "  Saved: #{chapter[:audio_path]}"
+
+    update_manifest_chapter(chapter)
+    save_manifest
+  end
+
+  def call_openai_tts(text)
+    chunks = chunk_text(text)
+    puts "    Split into #{chunks.length} chunks due to length" if chunks.length > 1
+
+    audio_segments = []
+
+    chunks.each_with_index do |chunk, i|
+      if chunks.length > 1
+        print "    Processing chunk #{i + 1}/#{chunks.length} (#{'%.1f' % (chunk.length.to_f / 4096 * 100)}% of limit)... "
+      end
+
+      uri = URI(OPENAI_TTS_URL)
+      request = Net::HTTP::Post.new(uri)
+      request['Authorization'] = "Bearer #{ENV['OPENAI_API_KEY']}"
+      request['Content-Type'] = 'application/json'
+
+      request.body = JSON.generate({
+        model: OPENAI_TTS_MODEL,
+        input: chunk,
+        voice: @voice,
+        response_format: 'mp3'
+      })
+
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true,
+                                 verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+        http.read_timeout = 300
+        http.request(request)
+      end
+
+      unless response.is_a?(Net::HTTPSuccess)
+        puts "\nError from OpenAI API: #{response.code} #{response.message}"
+        puts response.body
+        exit 1
+      end
+
+      audio_segments << response.body
+      puts 'Done' if chunks.length > 1
+    end
+
+    audio_segments.join
+  end
+
+  def chunk_text(text, max_length = 4096)
+    return [text] if text.length <= max_length
+
+    chunks = []
+    current_chunk = ''
+    paragraphs = text.split("\n\n")
+
+    paragraphs.each do |para|
+      if current_chunk.length + para.length + 2 <= max_length
+        current_chunk += (current_chunk.empty? ? '' : "\n\n") + para
+      else
+        chunks << current_chunk unless current_chunk.empty?
+        current_chunk = ''
+
+        if para.length > max_length
+          sentences = para.scan(/[^.!?]+[.!?]+/)
+          sentences.each do |sentence|
+            if current_chunk.length + sentence.length + 1 <= max_length
+              current_chunk += (current_chunk.empty? ? '' : ' ') + sentence.strip
+            else
+              chunks << current_chunk unless current_chunk.empty?
+              current_chunk = sentence.strip
+            end
+          end
+        else
+          current_chunk = para
+        end
+      end
+    end
+
+    chunks << current_chunk unless current_chunk.empty?
+    chunks
+  end
+
+  def update_manifest_chapter(chapter)
+    @manifest['chapters'] ||= []
+
+    existing = @manifest['chapters'].find { |c| c['id'] == chapter[:id] }
+    if existing
+      existing['text_hash'] = chapter[:text_hash]
+      existing['voice'] = @voice
+      existing['built_at'] = Time.now.iso8601
+    else
+      @manifest['chapters'] << {
+        'id' => chapter[:id],
+        'title' => chapter[:title],
+        'text_hash' => chapter[:text_hash],
+        'voice' => @voice,
+        'built_at' => Time.now.iso8601
+      }
+    end
+  end
+
+  def assemble_audiobook(chapters)
+    puts
+    puts 'Assembling audiobook...'
+
+    missing = chapters.reject { |c| File.exist?(c[:audio_path]) }
+    unless missing.empty?
+      puts "Error: Missing audio files for chapters: #{missing.map { |c| c[:id] }.join(', ')}"
+      puts 'Run without --chapter to build all chapters first.'
+      exit 1
+    end
+
+    output_path = File.join(BUILD_DIR, "#{BOOK_FILENAME}.m4b")
+    file_list_path = File.join(AUDIO_DIR, 'filelist.txt')
+
+    File.open(file_list_path, 'w') do |f|
+      chapters.each { |chapter| f.puts "file '#{chapter[:audio_path]}'" }
+    end
+
+    chapters_path = File.join(AUDIO_DIR, 'chapters.txt')
+    create_chapters_metadata(chapters, chapters_path)
+
+    concat_path = File.join(AUDIO_DIR, 'concat.m4a')
+    system('ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+           '-i', file_list_path, '-c:a', 'aac', '-b:a', '128k', concat_path)
+
+    unless $?.success?
+      puts 'Error: ffmpeg concatenation failed'
+      exit 1
+    end
+
+    cmd = ['ffmpeg', '-y', '-i', concat_path, '-i', chapters_path]
+    cover_path = File.join(BOOK_DIR, 'images/cover-square.png')
+
+    if File.exist?(cover_path)
+      cmd += ['-i', cover_path, '-map', '0:a', '-map', '2:v']
+      cmd += ['-disposition:v', 'attached_pic']
+    else
+      cmd += ['-map', '0:a']
+    end
+
+    cmd += ['-map_metadata', '1']
+    cmd += ['-metadata', "title=#{book_full_title}"]
+    cmd += ['-metadata', "artist=#{book_authors_string}"]
+    cmd += ['-metadata', "album=#{book_full_title}"]
+    cmd += ['-metadata', "genre=#{BOOK_GENRE}"]
+    cmd += ['-metadata', "date=#{Time.now.year}"]
+    cmd += ['-c:a', 'copy']
+    cmd += ['-c:v', 'copy'] if File.exist?(cover_path)
+    cmd << output_path
+
+    puts "Executing: #{cmd.join(' ')}"
+    system(*cmd)
+
+    unless $?.success?
+      puts 'Error: ffmpeg chapter marking/metadata failed'
+      exit 1
+    end
+
+    FileUtils.rm_f([file_list_path, concat_path])
+    puts "Created: #{output_path}"
+  end
+
+  def create_chapters_metadata(chapters, output_path)
+    durations = chapters.map { |c| get_audio_duration(c[:audio_path]) }
+
+    File.open(output_path, 'w') do |f|
+      f.puts ';FFMETADATA1'
+      f.puts "title=#{book_full_title}"
+      f.puts "artist=#{book_authors_string}"
+      f.puts
+
+      current_time_ms = 0
+      chapters.each_with_index do |chapter, index|
+        duration_ms = (durations[index] * 1000).to_i
+        f.puts '[CHAPTER]'
+        f.puts 'TIMEBASE=1/1000'
+        f.puts "START=#{current_time_ms}"
+        f.puts "END=#{current_time_ms + duration_ms}"
+        f.puts "title=#{chapter[:title]}"
+        f.puts
+        current_time_ms += duration_ms
+      end
+    end
+  end
+
+  def get_audio_duration(path)
+    output = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "#{path}" 2>&1`
+    output.strip.to_f
+  end
+
+  def load_manifest
+    File.exist?(MANIFEST_PATH) ? JSON.parse(File.read(MANIFEST_PATH)) : { 'chapters' => [] }
+  end
+
+  def save_manifest
+    @manifest['updated_at'] = Time.now.iso8601
+    @manifest['voice'] = @voice
+    File.write(MANIFEST_PATH, JSON.pretty_generate(@manifest))
+  end
+
+  def number_with_commas(number)
+    number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+end
+
+# ============================================================================
+# BOOK STATS
+# ============================================================================
+
+class BookStats
+  SINGLE_SYLLABLE_EXCEPTIONS = %w[
+    the a an and but or nor for yet so to of in on at by with from
+    been through would could should their there where here were are
+    have has had was were does done gone some come none one two
+  ].freeze
+
+  def initialize(options = {})
+    @by_chapter = options[:by_chapter] || false
+    @json_output = options[:json] || false
+  end
+
+  def run
+    chapters = discover_chapters
+
+    if chapters.empty?
+      puts "No chapters found in #{BOOK_DIR}"
+      return
+    end
+
+    all_stats = []
+    total_text = ''
+
+    chapters.each do |chapter|
+      content = File.read(chapter[:path])
+      plain_text = asciidoc_to_plain_text(content)
+      total_text += plain_text + "\n\n"
+
+      stats = calculate_stats(plain_text)
+      stats[:chapter] = chapter[:name]
+      stats[:file] = File.basename(chapter[:path])
+      all_stats << stats
+    end
+
+    total_stats = calculate_stats(total_text)
+    total_stats[:chapter] = 'TOTAL'
+    total_stats[:chapter_count] = chapters.length
+
+    if @json_output
+      output_json(all_stats, total_stats)
+    else
+      output_text(all_stats, total_stats)
+    end
+  end
+
+  private
+
+  def discover_chapters
+    chapters = []
+
+    Dir.glob(File.join(BOOK_DIR, '*', 'content.adoc')).sort.each do |path|
+      dir_name = File.basename(File.dirname(path))
+
+      if dir_name =~ /chapter-(\d+)-(.+)/
+        num = $1.to_i
+        name = $2.split('-').map(&:capitalize).join(' ')
+        chapters << { path: path, name: "Chapter #{num}: #{name}", sort_key: num }
+      else
+        name = dir_name.split('-').map(&:capitalize).join(' ')
+        sort_key = case dir_name
+                   when /foreword/ then -2
+                   when /preface/ then -1
+                   when /epilogue/ then 100
+                   else 50
+                   end
+        chapters << { path: path, name: name, sort_key: sort_key }
+      end
+    end
+
+    chapters.sort_by { |c| c[:sort_key] }
+  end
+
+  def asciidoc_to_plain_text(content)
+    text = content.dup
+    text.gsub!(/^:.*$/, '')
+    text.gsub!(/image::.*?\[.*?\]/, '')
+    text.gsub!(/^[\-=_]{3,}$/, '')
+    text.gsub!(/^\[.*?\]$/, '')
+    text.gsub!(/\*\*(.+?)\*\*/, '\1')
+    text.gsub!(/\*(.+?)\*/, '\1')
+    text.gsub!(/__(.+?)__/, '\1')
+    text.gsub!(/_(.+?)_/, '\1')
+    text.gsub!(/`(.+?)`/, '\1')
+    text.gsub!(/^=+ /, '')
+    text.gsub!(/^\[\..*?\]$/, '')
+    text.gsub!(/footnote:\[.*?\]/, '')
+    text.gsub!(/https?:\/\/\S+\[([^\]]+)\]/, '\1')
+    text.gsub!(/https?:\/\/\S+/, '')
+    text.gsub!(/\[.*?\]/, '')
+    text.gsub!(/\n{3,}/, "\n\n")
+    text.strip!
+    text
+  end
+
+  def calculate_stats(text)
+    words = extract_words(text)
+    sentences = extract_sentences(text)
+    paragraphs = text.split(/\n\n+/).reject(&:empty?)
+
+    word_count = words.length
+    sentence_count = sentences.length
+    paragraph_count = paragraphs.length
+
+    return empty_stats if word_count == 0 || sentence_count == 0
+
+    char_count = text.length
+    char_count_no_spaces = text.gsub(/\s/, '').length
+    syllable_count = words.sum { |w| count_syllables(w) }
+    complex_words = words.count { |w| count_syllables(w) >= 3 }
+
+    avg_word_length = words.sum(&:length).to_f / word_count
+    avg_sentence_length = word_count.to_f / sentence_count
+    avg_syllables_per_word = syllable_count.to_f / word_count
+
+    reading_time_mins = (word_count / 238.0).round
+    speaking_time_mins = (word_count / 150.0).round
+
+    flesch_ease = 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
+    flesch_ease = [[flesch_ease, 0].max, 100].min
+
+    fk_grade = (0.39 * avg_sentence_length) + (11.8 * avg_syllables_per_word) - 15.59
+    fk_grade = [fk_grade, 0].max
+
+    complex_word_pct = (complex_words.to_f / word_count) * 100
+    fog_index = 0.4 * (avg_sentence_length + complex_word_pct)
+
+    l = (char_count_no_spaces.to_f / word_count) * 100
+    s = (sentence_count.to_f / word_count) * 100
+    coleman_liau = (0.0588 * l) - (0.296 * s) - 15.8
+    coleman_liau = [coleman_liau, 0].max
+
+    ari = (4.71 * (char_count_no_spaces.to_f / word_count)) + (0.5 * avg_sentence_length) - 21.43
+    ari = [ari, 0].max
+
+    avg_grade = (fk_grade + fog_index + coleman_liau + ari) / 4.0
+
+    {
+      word_count: word_count,
+      sentence_count: sentence_count,
+      paragraph_count: paragraph_count,
+      character_count: char_count,
+      character_count_no_spaces: char_count_no_spaces,
+      syllable_count: syllable_count,
+      complex_word_count: complex_words,
+      avg_word_length: avg_word_length.round(2),
+      avg_sentence_length: avg_sentence_length.round(2),
+      avg_syllables_per_word: avg_syllables_per_word.round(2),
+      reading_time_mins: reading_time_mins,
+      speaking_time_mins: speaking_time_mins,
+      flesch_reading_ease: flesch_ease.round(1),
+      flesch_kincaid_grade: fk_grade.round(1),
+      gunning_fog_index: fog_index.round(1),
+      coleman_liau_index: coleman_liau.round(1),
+      automated_readability_index: ari.round(1),
+      average_grade_level: avg_grade.round(1)
+    }
+  end
+
+  def empty_stats
+    {
+      word_count: 0, sentence_count: 0, paragraph_count: 0,
+      character_count: 0, character_count_no_spaces: 0,
+      syllable_count: 0, complex_word_count: 0,
+      avg_word_length: 0, avg_sentence_length: 0, avg_syllables_per_word: 0,
+      reading_time_mins: 0, speaking_time_mins: 0,
+      flesch_reading_ease: 0, flesch_kincaid_grade: 0,
+      gunning_fog_index: 0, coleman_liau_index: 0,
+      automated_readability_index: 0, average_grade_level: 0
+    }
+  end
+
+  def extract_words(text)
+    text.scan(/[a-zA-Z]+(?:[''][a-zA-Z]+)?(?:-[a-zA-Z]+)*/).map(&:downcase)
+  end
+
+  def extract_sentences(text)
+    text.split(/(?<=[.!?])\s+(?=[A-Z"'])/).reject { |s| s.strip.empty? }
+  end
+
+  def count_syllables(word)
+    word = word.downcase.gsub(/[^a-z]/, '')
+    return 1 if word.length <= 2
+    return 1 if SINGLE_SYLLABLE_EXCEPTIONS.include?(word)
+
+    syllables = word.scan(/[aeiouy]+/).length
+    syllables -= 1 if word.end_with?('e') && !word.end_with?('le')
+    syllables -= 1 if word =~ /(?:es|ed)$/ && word !~ /[aeiou](?:es|ed)$/
+    syllables += 1 if word =~ /[^aeiou]le$/
+    [syllables, 1].max
+  end
+
+  def flesch_interpretation(score)
+    case score
+    when 90..100 then 'Very Easy (5th grade)'
+    when 80...90 then 'Easy (6th grade)'
+    when 70...80 then 'Fairly Easy (7th grade)'
+    when 60...70 then 'Standard (8th-9th grade)'
+    when 50...60 then 'Fairly Difficult (10th-12th grade)'
+    when 30...50 then 'Difficult (College)'
+    else 'Very Difficult (College graduate)'
+    end
+  end
+
+  def output_json(chapter_stats, total_stats)
+    output = {
+      generated_at: Time.now.iso8601,
+      total: total_stats,
+      chapters: chapter_stats
+    }
+    puts JSON.pretty_generate(output)
+  end
+
+  def output_text(chapter_stats, total_stats)
+    puts '=' * 70
+    puts 'BOOK STATISTICS'
+    puts '=' * 70
+    puts
+
+    puts 'OVERALL SUMMARY'
+    puts '-' * 40
+    puts format('%-30s %s', 'Total Chapters:', total_stats[:chapter_count])
+    puts format('%-30s %s', 'Total Words:', number_with_commas(total_stats[:word_count]))
+    puts format('%-30s %s', 'Total Sentences:', number_with_commas(total_stats[:sentence_count]))
+    puts format('%-30s %s', 'Total Paragraphs:', number_with_commas(total_stats[:paragraph_count]))
+    puts format('%-30s %s', 'Total Characters:', number_with_commas(total_stats[:character_count]))
+    puts
+    puts format('%-30s %d minutes', 'Estimated Reading Time:', total_stats[:reading_time_mins])
+    puts format('%-30s %d minutes', 'Estimated Speaking Time:', total_stats[:speaking_time_mins])
+    puts
+
+    puts 'READING LEVEL ANALYSIS'
+    puts '-' * 40
+    puts format('%-30s %.1f', 'Flesch Reading Ease:', total_stats[:flesch_reading_ease])
+    puts format('%-30s %s', '  Interpretation:', flesch_interpretation(total_stats[:flesch_reading_ease]))
+    puts
+    puts format('%-30s %.1f', 'Flesch-Kincaid Grade:', total_stats[:flesch_kincaid_grade])
+    puts format('%-30s %.1f', 'Gunning Fog Index:', total_stats[:gunning_fog_index])
+    puts format('%-30s %.1f', 'Coleman-Liau Index:', total_stats[:coleman_liau_index])
+    puts format('%-30s %.1f', 'Automated Readability:', total_stats[:automated_readability_index])
+    puts format('%-30s %.1f', 'Average Grade Level:', total_stats[:average_grade_level])
+    puts
+
+    puts 'WRITING STATISTICS'
+    puts '-' * 40
+    puts format('%-30s %.2f', 'Avg Words per Sentence:', total_stats[:avg_sentence_length])
+    puts format('%-30s %.2f', 'Avg Syllables per Word:', total_stats[:avg_syllables_per_word])
+    puts format('%-30s %.2f', 'Avg Word Length (chars):', total_stats[:avg_word_length])
+    puts format('%-30s %s (%.1f%%)', 'Complex Words (3+ syllables):',
+                number_with_commas(total_stats[:complex_word_count]),
+                (total_stats[:complex_word_count].to_f / total_stats[:word_count] * 100))
+    puts
+
+    if @by_chapter
+      puts '=' * 70
+      puts 'BY CHAPTER'
+      puts '=' * 70
+      puts
+
+      puts format('%-35s %8s %8s %6s %6s', 'Chapter', 'Words', 'Sents', 'F-K', 'Flesch')
+      puts '-' * 70
+
+      chapter_stats.each do |stats|
+        puts format('%-35s %8s %8s %6.1f %6.1f',
+                    truncate(stats[:chapter], 35),
+                    number_with_commas(stats[:word_count]),
+                    number_with_commas(stats[:sentence_count]),
+                    stats[:flesch_kincaid_grade],
+                    stats[:flesch_reading_ease])
+      end
+
+      puts '-' * 70
+      puts format('%-35s %8s %8s %6.1f %6.1f',
+                  'TOTAL',
+                  number_with_commas(total_stats[:word_count]),
+                  number_with_commas(total_stats[:sentence_count]),
+                  total_stats[:flesch_kincaid_grade],
+                  total_stats[:flesch_reading_ease])
+    end
+
+    puts
+    puts '=' * 70
+    puts
+    puts 'Reading Level Guide:'
+    puts '  Flesch Reading Ease: 0-100 (higher = easier to read)'
+    puts '  Grade Level scores: Approximate US school grade (e.g., 8.0 = 8th grade)'
+    puts
+    puts 'For reference:'
+    puts '  - Popular fiction: Grade 7-8'
+    puts '  - Quality newspapers: Grade 9-10'
+    puts '  - Academic papers: Grade 12+'
+    puts '  - Gladwell/Bryson style: Grade 8-10'
+  end
+
+  def number_with_commas(number)
+    number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  def truncate(string, max_length)
+    return string if string.length <= max_length
+    string[0...(max_length - 3)] + '...'
+  end
+end
+
+# ============================================================================
+# BOOK EXPORTER
+# ============================================================================
+
+class BookExporter
+  def initialize(options = {})
+    @format = options[:format] || :txt
+    @output_file = options[:output]
+  end
+
+  def run
+    chapters = discover_chapters
+
+    if chapters.empty?
+      puts "No chapters found in #{BOOK_DIR}"
+      return
+    end
+
+    content = case @format
+              when :txt then export_txt(chapters)
+              when :markdown then export_markdown(chapters)
+              else
+                puts "Unknown format: #{@format}"
+                return
+              end
+
+    if @output_file
+      File.write(@output_file, content)
+      puts "Exported to: #{@output_file}"
+    else
+      puts content
+    end
+  end
+
+  private
+
+  def discover_chapters
+    chapters = []
+
+    Dir.glob(File.join(BOOK_DIR, '*', 'content.adoc')).sort.each do |path|
+      dir_name = File.basename(File.dirname(path))
+
+      if dir_name =~ /chapter-(\d+)-(.+)/
+        num = $1.to_i
+        name = $2.split('-').map(&:capitalize).join(' ')
+        chapters << {
+          path: path,
+          title: name,
+          chapter_num: num,
+          sort_key: num,
+          is_chapter: true
+        }
+      else
+        name = dir_name.split('-').map(&:capitalize).join(' ')
+        sort_key = case dir_name
+                   when /foreword/ then -2
+                   when /preface/ then -1
+                   when /epilogue/ then 100
+                   else 50
+                   end
+        chapters << {
+          path: path,
+          title: name,
+          chapter_num: nil,
+          sort_key: sort_key,
+          is_chapter: false
+        }
+      end
+    end
+
+    chapters.sort_by { |c| c[:sort_key] }
+  end
+
+  def export_txt(chapters)
+    lines = []
+
+    lines << ''
+    lines << center_text(BOOK_TITLE, 70)
+    lines << ''
+    lines << center_text(BOOK_SUBTITLE, 70)
+    lines << ''
+    lines << ''
+    BOOK_AUTHORS.each { |author| lines << center_text(author, 70) }
+    lines << ''
+    lines << ''
+    lines << '=' * 70
+    lines << ''
+    lines << ''
+
+    chapters.each_with_index do |chapter, idx|
+      content = File.read(chapter[:path])
+      plain_text = asciidoc_to_txt(content, chapter)
+
+      lines << plain_text
+      lines << ''
+      lines << ''
+
+      if idx < chapters.length - 1
+        lines << '=' * 70
+        lines << ''
+        lines << ''
+      end
+    end
+
+    lines.join("\n")
+  end
+
+  def asciidoc_to_txt(content, chapter_info)
+    text = content.dup
+
+    title = nil
+    title = $1.strip if text =~ /^= (.+)$/
+
+    text.gsub!(/^:.*$/, '')
+    text.gsub!(/^\[\..*?\]\n/, '')
+    text.gsub!(/image::.*?\[.*?\]/, '')
+    text.gsub!(/^[\-]{3,}$/, '')
+    text.gsub!(/^[=]{3,}$/, '')
+    text.gsub!(/^[_]{3,}$/, '')
+    text.gsub!(/^\[.*?\]$/, '')
+    text.gsub!(/^= .+$/, '')
+    text.gsub!(/^=== (.+)$/) { "\n#{$1}\n#{'-' * $1.length}\n" }
+    text.gsub!(/^== (.+)$/) { "\n#{$1.upcase}\n\n" }
+    text.gsub!(/\*\*(.+?)\*\*/, '\1')
+    text.gsub!(/\*(.+?)\*/, '\1')
+    text.gsub!(/__(.+?)__/, '\1')
+    text.gsub!(/_(.+?)_/, '\1')
+    text.gsub!(/`(.+?)`/, '\1')
+    text.gsub!(/https?:\/\/\S+\[([^\]]+)\]/, '\1')
+    text.gsub!(/link:\S+\[([^\]]+)\]/, '\1')
+    text.gsub!(/footnote:\[([^\]]+)\]/, ' (\1)')
+    text.gsub!(/\n{4,}/, "\n\n\n")
+    text.strip!
+
+    header_lines = []
+    if chapter_info[:is_chapter]
+      header_lines << "Chapter #{chapter_info[:chapter_num]}"
+      header_lines << ''
+    end
+    header_lines << title.upcase if title
+    header_lines << ''
+
+    header_lines.join("\n") + "\n" + text
+  end
+
+  def center_text(text, width)
+    padding = [(width - text.length) / 2, 0].max
+    ' ' * padding + text
+  end
+
+  def export_markdown(chapters)
+    lines = []
+
+    lines << "# #{BOOK_TITLE}"
+    lines << ''
+    lines << "*#{BOOK_SUBTITLE}*"
+    lines << ''
+    lines << BOOK_AUTHORS.join(' | ')
+    lines << ''
+    lines << '---'
+    lines << ''
+
+    chapters.each do |chapter|
+      content = File.read(chapter[:path])
+      markdown = asciidoc_to_markdown(content, chapter)
+
+      lines << markdown
+      lines << ''
+      lines << '---'
+      lines << ''
+    end
+
+    lines.join("\n")
+  end
+
+  def asciidoc_to_markdown(content, chapter_info)
+    text = content.dup
+
+    text.gsub!(/^:.*$/, '')
+    text.gsub!(/^\[\.lead\]\n_(.+?)_$/m, '*\1*')
+    text.gsub!(/^\[\..*?\]\n/, '')
+    text.gsub!(/image::.*?\[.*?\]/, '')
+    text.gsub!(/^[\-]{3,}$/, '')
+    text.gsub!(/^[=]{3,}$/, '')
+    text.gsub!(/^[_]{3,}$/, '')
+    text.gsub!(/^\[.*?\]$/, '')
+
+    if chapter_info[:is_chapter]
+      text.gsub!(/^= (.+)$/, "## Chapter #{chapter_info[:chapter_num]}: \\1")
+    else
+      text.gsub!(/^= (.+)$/, '## \1')
+    end
+
+    text.gsub!(/^=== (.+)$/, '#### \1')
+    text.gsub!(/^== (.+)$/, '### \1')
+    text.gsub!(/\*\*(.+?)\*\*/, '**\1**')
+    text.gsub!(/__(.+?)__/, '*\1*')
+    text.gsub!(/`(.+?)`/, '`\1`')
+    text.gsub!(/https?:\/\/(\S+)\[([^\]]+)\]/, '[\2](\1)')
+    text.gsub!(/footnote:\[([^\]]+)\]/, '[^note]: \1')
+    text.gsub!(/\n{4,}/, "\n\n\n")
+    text.strip!
+    text
+  end
+end
+
+# ============================================================================
+# NOTE TRANSCRIBER
+# ============================================================================
+
+class NoteTranscriber
+  AUDIO_DIR = File.join(NOTES_DIR, 'audio')
+  COMPLETE_AUDIO_DIR = File.join(NOTES_DIR, 'complete-audio')
+  CSV_PATH = File.join(NOTES_DIR, 'audio-notes.csv')
+  OPENAI_WHISPER_URL = 'https://api.openai.com/v1/audio/transcriptions'
+  WHISPER_MODEL = 'whisper-1'
+
+  def initialize(options = {})
+    @dry_run = options[:dry_run] || false
+  end
+
+  def run
+    validate_api_key! unless @dry_run
+    ensure_directories
+
+    existing_notes = load_existing_notes
+    audio_files = discover_audio_files
+    transcribed_files = existing_notes.map { |note| note['filename'] }
+    new_files = audio_files.reject { |f| transcribed_files.include?(File.basename(f)) }
+
+    if @dry_run
+      show_dry_run(existing_notes, audio_files, new_files)
+      return
+    end
+
+    if new_files.empty?
+      puts 'All audio files have been transcribed.'
+      puts "Total notes: #{existing_notes.length}"
+      return
+    end
+
+    puts "Found #{new_files.length} new file(s) to transcribe..."
+    puts
+
+    new_notes = []
+    new_files.each do |file_path|
+      note = transcribe_file(file_path)
+      new_notes << note if note
+    end
+
+    all_notes = (existing_notes + new_notes).sort_by { |n| n['filename'] }
+    save_notes(all_notes)
+    puts
+    puts "Done! Total notes: #{all_notes.length}"
+  end
+
+  private
+
+  def validate_api_key!
+    return if ENV['OPENAI_API_KEY']
+
+    puts "Error: OPENAI_API_KEY environment variable is not set."
+    puts "Please set it with: export OPENAI_API_KEY='your-key-here'"
+    exit 1
+  end
+
+  def ensure_directories
+    FileUtils.mkdir_p(COMPLETE_AUDIO_DIR)
+  end
+
+  def load_existing_notes
+    return [] unless File.exist?(CSV_PATH)
+
+    notes = []
+    CSV.foreach(CSV_PATH, headers: true) { |row| notes << row.to_h }
+    notes
+  end
+
+  def discover_audio_files
+    Dir.glob(File.join(AUDIO_DIR, '*.mp3')).sort
+  end
+
+  def show_dry_run(existing_notes, audio_files, new_files)
+    puts '=' * 60
+    puts 'DRY RUN - No API calls will be made'
+    puts '=' * 60
+    puts
+    puts "Existing notes in CSV: #{existing_notes.length}"
+    puts "Audio files found: #{audio_files.length}"
+    puts "Files to transcribe: #{new_files.length}"
+    puts
+
+    if new_files.any?
+      puts 'New files to transcribe:'
+      new_files.each { |f| puts "  - #{File.basename(f)}" }
+    end
+
+    current_files = audio_files.map { |f| File.basename(f) }
+    orphaned = existing_notes.reject { |n| current_files.include?(n['filename']) }
+
+    if orphaned.any?
+      puts
+      puts 'Orphaned notes (source file deleted, note preserved):'
+      orphaned.each { |n| puts "  - #{n['filename']}" }
+    end
+
+    puts '=' * 60
+  end
+
+  def transcribe_file(file_path)
+    filename = File.basename(file_path)
+    print "Transcribing: #{filename}... "
+
+    begin
+      transcription = call_whisper_api(file_path)
+      chapter = extract_chapter(transcription)
+
+      note = {
+        'filename' => filename,
+        'transcribed_at' => Time.now.iso8601,
+        'chapter' => chapter,
+        'note' => transcription
+      }
+
+      puts 'Done'
+      puts "  Chapter: #{chapter}" if chapter
+      puts "  #{transcription[0..100]}#{'...' if transcription.length > 100}"
+
+      # Move successfully transcribed file to complete-audio directory
+      dest_path = File.join(COMPLETE_AUDIO_DIR, filename)
+      FileUtils.mv(file_path, dest_path)
+      puts "  Moved to: #{dest_path}"
+      puts
+
+      note
+    rescue => e
+      puts "Error: #{e.message}"
+      puts "  File left in place for retry"
+      nil
+    end
+  end
+
+  def call_whisper_api(file_path)
+    uri = URI(OPENAI_WHISPER_URL)
+    boundary = "----FormBoundary#{rand(1_000_000_000)}"
+
+    file_content = File.binread(file_path)
+    filename = File.basename(file_path)
+
+    body = []
+    body << "--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"file\"; filename=\"#{filename}\"\r\n"
+    body << "Content-Type: audio/mpeg\r\n\r\n"
+    body << file_content
+    body << "\r\n--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+    body << WHISPER_MODEL
+    body << "\r\n--#{boundary}--\r\n"
+
+    request = Net::HTTP::Post.new(uri)
+    request['Authorization'] = "Bearer #{ENV['OPENAI_API_KEY']}"
+    request['Content-Type'] = "multipart/form-data; boundary=#{boundary}"
+    request.body = body.join
+
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true,
+                               verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+      http.read_timeout = 120
+      http.request(request)
+    end
+
+    unless response.is_a?(Net::HTTPSuccess)
+      raise "Whisper API error: #{response.code} #{response.message} - #{response.body}"
+    end
+
+    result = JSON.parse(response.body)
+    result['text'].strip
+  end
+
+  def extract_chapter(text)
+    number_words = {
+      'one' => '1', 'two' => '2', 'three' => '3', 'four' => '4', 'five' => '5',
+      'six' => '6', 'seven' => '7', 'eight' => '8', 'nine' => '9', 'ten' => '10',
+      'eleven' => '11', 'twelve' => '12', 'thirteen' => '13', 'fourteen' => '14'
+    }
+
+    return $1 if text =~ /chapter\s+(\d+)/i
+
+    number_words.each do |word, digit|
+      return digit if text =~ /chapter\s+#{word}/i
+    end
+
+    return 'epilogue' if text =~ /epilogue/i
+    return 'prologue' if text =~ /prologue/i
+    return 'preface' if text =~ /preface/i
+    return 'foreword' if text =~ /foreword/i
+
+    nil
+  end
+
+  def save_notes(notes)
+    CSV.open(CSV_PATH, 'w') do |csv|
+      csv << %w[filename transcribed_at chapter note]
+      notes.each do |note|
+        csv << [note['filename'], note['transcribed_at'], note['chapter'], note['note']]
+      end
+    end
+    puts "Saved to: #{CSV_PATH}"
+  end
+end
+
+# ============================================================================
+# RUN CLI
+# ============================================================================
+
+PressCLI.start(ARGV)

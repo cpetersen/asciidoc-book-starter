@@ -2,10 +2,10 @@
 = Pancakes in Space
 :author: Mike Willson
 :creator: {author}
-:copyright: 2023 Mike Willson
+:copyright: 2026 Mike Willson
 :email: mike@lirantal.com
 :revnumber: v1.0
-:revdate: 01.01.2022
+:revdate: 01.01.2026
 :revremark: First draft
 :doctype: book
 :leveloffset: +1

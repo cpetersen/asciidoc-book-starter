@@ -1,0 +1,14 @@
+# Book metadata configuration
+# This file is used by bin/press to generate output files
+
+title: "PANCAKES IN SPACE"
+subtitle: "Subtitle Goes Here"
+authors:
+  - "Mike Willson"
+
+# Optional: Override the output filename (defaults to lowercase, hyphenated title)
+# filename: "pancakes-in-space"
+
+# Audiobook-specific settings
+audiobook:
+  genre: "Audiobook"
