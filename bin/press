@@ -627,10 +627,10 @@ class AudiobookBuilder
   end
 
   def validate_api_key!
-    return if ENV['PERSONAL_OPENAI_API_KEY']
+    return if ENV['OPENAI_API_KEY']
 
-    puts "Error: PERSONAL_OPENAI_API_KEY environment variable is not set."
-    puts "Please set it with: export PERSONAL_OPENAI_API_KEY='your-key-here'"
+    puts "Error: OPENAI_API_KEY environment variable is not set."
+    puts "Please set it with: export OPENAI_API_KEY='your-key-here'"
     exit 1
   end
 
@@ -659,7 +659,7 @@ class AudiobookBuilder
 
       uri = URI(OPENAI_TTS_URL)
       request = Net::HTTP::Post.new(uri)
-      request['Authorization'] = "Bearer #{ENV['PERSONAL_OPENAI_API_KEY']}"
+      request['Authorization'] = "Bearer #{ENV['OPENAI_API_KEY']}"
       request['Content-Type'] = 'application/json'
 
       request.body = JSON.generate({
@@ -1412,10 +1412,10 @@ class NoteTranscriber
   private
 
   def validate_api_key!
-    return if ENV['PERSONAL_OPENAI_API_KEY']
+    return if ENV['OPENAI_API_KEY']
 
-    puts "Error: PERSONAL_OPENAI_API_KEY environment variable is not set."
-    puts "Please set it with: export PERSONAL_OPENAI_API_KEY='your-key-here'"
+    puts "Error: OPENAI_API_KEY environment variable is not set."
+    puts "Please set it with: export OPENAI_API_KEY='your-key-here'"
     exit 1
   end
 
@@ -1513,7 +1513,7 @@ class NoteTranscriber
     body << "\r\n--#{boundary}--\r\n"
 
     request = Net::HTTP::Post.new(uri)
-    request['Authorization'] = "Bearer #{ENV['PERSONAL_OPENAI_API_KEY']}"
+    request['Authorization'] = "Bearer #{ENV['OPENAI_API_KEY']}"
     request['Content-Type'] = "multipart/form-data; boundary=#{boundary}"
     request.body = body.join
 
