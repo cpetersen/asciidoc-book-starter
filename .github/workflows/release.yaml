@@ -1,32 +1,32 @@
-name: book-generate-pdf
-run-name: "Generate Book PDF"
+name: release
+run-name: "Release ${{ github.ref_name }}"
 
 on:
-  pull_request:
-    branches:
-      - main
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
 
 env:
   BOOK_SOURCE_DIR: ${{ github.workspace }}/book
   BOOK_BUILD_DIR: ${{ github.workspace }}/build
 
 jobs:
-  build-pdf:
+  release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     container:
       image: asciidoctor/docker-asciidoctor
       volumes:
         - ${{ github.workspace }}:/documents
     steps:
       - uses: actions/checkout@v4
+
       - name: "Set filename"
         id: filename
         run: |
-          TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M")
-          echo "pdf=${{ github.event.repository.name }}-${TIMESTAMP}.pdf" >> $GITHUB_OUTPUT
+          echo "pdf=${{ github.event.repository.name }}-${{ github.ref_name }}.pdf" >> $GITHUB_OUTPUT
+
       - name: "Build PDF"
         run: |
           GITSHA=$(echo "${{ github.sha }}" | cut -c1-7)
@@ -38,8 +38,9 @@ jobs:
             -D $BOOK_BUILD_DIR \
             -o ${{ steps.filename.outputs.pdf }} \
             $BOOK_SOURCE_DIR/index.adoc
-      - name: "Upload PDF artifact"
-        uses: actions/upload-artifact@v4
+
+      - name: "Create Release"
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.event.repository.name }}-pdf
-          path: build/${{ steps.filename.outputs.pdf }}
+          files: build/${{ steps.filename.outputs.pdf }}
+          generate_release_notes: true
