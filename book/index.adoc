@@ -2,17 +2,18 @@
 = Pancakes in Space
 :author: Mike Willson
 :creator: {author}
-:copyright: 2026 Mike Willson
+:year: {docyear}
+:copyright: {docyear} Mike Willson
 :email: mike@lirantal.com
-:revnumber: v1.0
-:revdate: 01.01.2026
-:revremark: First draft
+:revnumber: v1.0 {gitsha}
+:revdate: {docdate}
+:revremark: Working Draft
 :doctype: book
 :leveloffset: +1
 :front-cover-image: image:cover.jpeg[width=1700,height=2800]
 :sectnums:
 :sectlinks:
-:toc: left
+:toc: macro
 :toclevels: 4
 :toc-title: Table of Contents
 :description: HTML meta tag content for description
@@ -45,6 +46,10 @@ The following is a bunch of text:
 
 This is the optional preamble (an untitled section body). Useful for
 writing simple sectionless documents consisting only of a preamble.
+
+include::copyright.adoc[]
+
+toc::[]
 
 include::preface.adoc[]
 

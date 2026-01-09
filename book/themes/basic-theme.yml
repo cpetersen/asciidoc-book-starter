@@ -158,7 +158,13 @@ conum:
   font-size: 12
   font-kerning: none
   glyphs: filled
-    
+
+running-content:
+  start-at: after-toc
+
+page-numbering:
+  start-at: after-toc
+
 footer:
   recto:
     right:

@@ -70,10 +70,12 @@ class PressCLI < Thor
   desc 'pdf', 'Build the book as PDF (requires Docker)'
   def pdf
     say 'Building PDF...', :green
+    gitsha = `git rev-parse --short HEAD`.strip
     Dir.chdir(ROOT_DIR) do
       system(
         'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
         'asciidoctor/docker-asciidoctor', 'asciidoctor-pdf',
+        '-a', "gitsha=#{gitsha}",
         '-D', 'build',
         '-o', "#{BOOK_FILENAME}.pdf",
         'book/index.adoc'
@@ -90,10 +92,12 @@ class PressCLI < Thor
   desc 'epub', 'Build the book as ePub (requires Docker)'
   def epub
     say 'Building ePub...', :green
+    gitsha = `git rev-parse --short HEAD`.strip
     Dir.chdir(ROOT_DIR) do
       system(
         'docker', 'run', '--rm', '-v', "#{ROOT_DIR}:/documents/",
         'asciidoctor/docker-asciidoctor:1.63', 'asciidoctor-epub3',
+        '-a', "gitsha=#{gitsha}",
         '-D', 'build',
         '-o', "#{BOOK_FILENAME}.epub",
         'book/index.adoc'
@@ -447,16 +451,9 @@ class AudiobookBuilder
       elsif line =~ /^include::(.+)\[\]$/
         include_path = $1
 
-        # Resolve the full path
-        if include_path.include?('/')
-          # Directory-based include like "chapter-01-the-lock-and-the-key/content.adoc"
-          full_path = File.join(BOOK_DIR, include_path)
-        else
-          # Standalone file like "foreword.adoc"
-          full_path = File.join(BOOK_DIR, include_path)
-        end
-
-        next unless File.exist?(full_path)
+        # Check for audiobook-specific version of the file
+        full_path, is_audiobook_version = resolve_audiobook_path(include_path)
+        next unless full_path && File.exist?(full_path)
 
         content = File.read(full_path)
         raw_title = extract_title(content)
@@ -491,8 +488,8 @@ class AudiobookBuilder
           plain_text = asciidoc_to_plain_text(content, nil)
         end
 
-        # Skip very short content (likely placeholders)
-        next if plain_text.strip.empty? || plain_text.length < 100
+        # Skip very short content (likely placeholders), but always include audiobook-specific versions
+        next if !is_audiobook_version && (plain_text.strip.empty? || plain_text.length < 100)
 
         text_hash = Digest::SHA256.hexdigest(plain_text)
 
@@ -512,6 +509,33 @@ class AudiobookBuilder
     end
 
     chapters
+  end
+
+  # Check for audiobook-specific version of a file
+  # For "foreword.adoc" -> checks for "foreword-audiobook.adoc"
+  # For "chapter-01-foo/content.adoc" -> checks for "chapter-01-foo/content-audiobook.adoc"
+  # Returns [full_path, is_audiobook_version]
+  def resolve_audiobook_path(include_path)
+    if include_path.include?('/')
+      # Directory-based: "chapter-01-foo/content.adoc"
+      dir = File.dirname(include_path)
+      base = File.basename(include_path, '.adoc')
+      audiobook_path = File.join(BOOK_DIR, dir, "#{base}-audiobook.adoc")
+      regular_path = File.join(BOOK_DIR, include_path)
+    else
+      # Standalone: "foreword.adoc"
+      base = File.basename(include_path, '.adoc')
+      audiobook_path = File.join(BOOK_DIR, "#{base}-audiobook.adoc")
+      regular_path = File.join(BOOK_DIR, include_path)
+    end
+
+    if File.exist?(audiobook_path)
+      [audiobook_path, true]
+    elsif File.exist?(regular_path)
+      [regular_path, false]
+    else
+      [nil, false]
+    end
   end
 
   def extract_title(content)
